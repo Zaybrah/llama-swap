@@ -183,6 +183,7 @@ func (pm *ProxyManager) setupGinEngine() {
 	pm.ginEngine.POST("/api/show", pm.showModelOllamaHandler)
 	pm.ginEngine.GET("/api/ps", pm.listRunningModelsOllamaHandler)
 	pm.ginEngine.GET("/api/tags", pm.listModelsOllamaHandler)
+	pm.ginEngine.GET("/api/version", pm.versionOllamaHandler)
 
 	pm.ginEngine.HEAD("/", func(c *gin.Context) {
 		c.String(http.StatusOK, "")
@@ -420,6 +421,10 @@ func (pm *ProxyManager) showModelOllamaHandler(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, resp)
+}
+
+func (pm *ProxyManager) versionOllamaHandler(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{"version": Version})
 }
 
 func (pm *ProxyManager) proxyToUpstream(c *gin.Context) {
