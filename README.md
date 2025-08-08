@@ -30,6 +30,7 @@ Written in golang, it is very easy to install (single binary with no dependencie
   - `api/chat`
   - `api/embed`
   - `api/embeddings`
+  - `api/version` - show build version
 - ✅ llama-swap custom API endpoints
   - `/ui` - web UI
   - `/log` - remote log monitoring

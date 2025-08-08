@@ -38,6 +38,9 @@ func main() {
 		os.Exit(0)
 	}
 
+	// Pass build version information to proxy package for API responses.
+	proxy.Version = version
+
 	config, err := proxy.LoadConfig(*configPath)
 	if err != nil {
 		fmt.Printf("Error loading config: %v\n", err)
