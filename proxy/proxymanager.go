@@ -3,10 +3,12 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"sort"
 	"strconv"
@@ -172,6 +174,11 @@ func (pm *ProxyManager) setupGinEngine() {
 	pm.ginEngine.POST("/v1/audio/transcriptions", pm.proxyOAIPostFormHandler)
 
 	pm.ginEngine.GET("/v1/models", pm.listModelsHandler)
+
+	// Ollama compatible endpoints
+	pm.ginEngine.POST("/api/generate", mm, pm.proxyOllamaHandler)
+	pm.ginEngine.POST("/api/chat", mm, pm.proxyOllamaHandler)
+	pm.ginEngine.GET("/api/tags", pm.listModelsOllamaHandler)
 
 	// in proxymanager_loghandlers.go
 	pm.ginEngine.GET("/logs", pm.sendLogsHandlers)
@@ -353,6 +360,22 @@ func (pm *ProxyManager) listModelsHandler(c *gin.Context) {
 	})
 }
 
+func (pm *ProxyManager) listModelsOllamaHandler(c *gin.Context) {
+	models := make([]gin.H, 0, len(pm.config.Models))
+	for id, modelConfig := range pm.config.Models {
+		if modelConfig.Unlisted {
+			continue
+		}
+		models = append(models, gin.H{"name": id})
+	}
+	sort.Slice(models, func(i, j int) bool {
+		si, _ := models[i]["name"].(string)
+		sj, _ := models[j]["name"].(string)
+		return si < sj
+	})
+	c.JSON(http.StatusOK, gin.H{"models": models})
+}
+
 func (pm *ProxyManager) proxyToUpstream(c *gin.Context) {
 	requestedModel := c.Param("model_id")
 
@@ -434,6 +457,110 @@ func (pm *ProxyManager) proxyOAIHandler(c *gin.Context) {
 		pm.proxyLogger.Errorf("Error Proxying Request for processGroup %s and model %s", processGroup.id, realModelName)
 		return
 	}
+}
+
+func (pm *ProxyManager) proxyOllamaHandler(c *gin.Context) {
+	bodyBytes, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		pm.sendErrorResponse(c, http.StatusBadRequest, "could not ready request body")
+		return
+	}
+
+	requestedModel := gjson.GetBytes(bodyBytes, "model").String()
+	if requestedModel == "" {
+		pm.sendErrorResponse(c, http.StatusBadRequest, "missing or invalid 'model' key")
+		return
+	}
+
+	realModelName, found := pm.config.RealModelName(requestedModel)
+	if !found {
+		pm.sendErrorResponse(c, http.StatusBadRequest, fmt.Sprintf("could not find real modelID for %s", requestedModel))
+		return
+	}
+
+	processGroup, _, err := pm.swapProcessGroup(realModelName)
+	if err != nil {
+		pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("error swapping process group: %s", err.Error()))
+		return
+	}
+
+	useModelName := pm.config.Models[realModelName].UseModelName
+	if useModelName != "" {
+		bodyBytes, err = sjson.SetBytes(bodyBytes, "model", useModelName)
+		if err != nil {
+			pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("error rewriting model name in JSON: %s", err.Error()))
+			return
+		}
+	}
+
+	stripParams, err := pm.config.Models[realModelName].Filters.SanitizedStripParams()
+	if err != nil {
+		pm.proxyLogger.Errorf("Error sanitizing strip params string: %s, %s", pm.config.Models[realModelName].Filters.StripParams, err.Error())
+	} else {
+		for _, param := range stripParams {
+			pm.proxyLogger.Debugf("<%s> stripping param: %s", realModelName, param)
+			bodyBytes, err = sjson.DeleteBytes(bodyBytes, param)
+			if err != nil {
+				pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("error deleting parameter %s from request", param))
+				return
+			}
+		}
+	}
+
+	// ensure non-streaming for easier conversion
+	bodyBytes, err = sjson.SetBytes(bodyBytes, "stream", false)
+	if err != nil {
+		pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("error setting stream param: %s", err.Error()))
+		return
+	}
+
+	c.Request.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+	c.Request.Header.Del("transfer-encoding")
+	c.Request.Header.Set("content-length", strconv.Itoa(len(bodyBytes)))
+	c.Request.ContentLength = int64(len(bodyBytes))
+
+	endpoint := c.Request.URL.Path
+	switch endpoint {
+	case "/api/chat":
+		c.Request.URL.Path = "/v1/chat/completions"
+	default:
+		c.Request.URL.Path = "/v1/completions"
+	}
+
+	recorder := httptest.NewRecorder()
+	if err := processGroup.ProxyRequest(realModelName, recorder, c.Request); err != nil {
+		pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("error proxying request: %s", err.Error()))
+		pm.proxyLogger.Errorf("Error Proxying Request for processGroup %s and model %s", processGroup.id, realModelName)
+		return
+	}
+
+	respBody := recorder.Body.Bytes()
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	var out []byte
+	if endpoint == "/api/chat" {
+		content := gjson.GetBytes(respBody, "choices.0.message.content").String()
+		msg := gin.H{
+			"model":      requestedModel,
+			"created_at": now,
+			"message": gin.H{
+				"role":    "assistant",
+				"content": content,
+			},
+			"done": true,
+		}
+		out, _ = json.Marshal(msg)
+	} else {
+		text := gjson.GetBytes(respBody, "choices.0.text").String()
+		msg := gin.H{
+			"model":      requestedModel,
+			"created_at": now,
+			"response":   text,
+			"done":       true,
+		}
+		out, _ = json.Marshal(msg)
+	}
+
+	c.Data(recorder.Code, "application/json", out)
 }
 
 func (pm *ProxyManager) proxyOAIPostFormHandler(c *gin.Context) {
