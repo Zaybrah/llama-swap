@@ -178,7 +178,15 @@ func (pm *ProxyManager) setupGinEngine() {
 	// Ollama compatible endpoints
 	pm.ginEngine.POST("/api/generate", mm, pm.proxyOllamaHandler)
 	pm.ginEngine.POST("/api/chat", mm, pm.proxyOllamaHandler)
+	pm.ginEngine.POST("/api/embed", mm, pm.proxyOllamaEmbeddingsHandler)
+	pm.ginEngine.POST("/api/embeddings", mm, pm.proxyOllamaEmbeddingsHandler)
+	pm.ginEngine.POST("/api/show", pm.showModelOllamaHandler)
+	pm.ginEngine.GET("/api/ps", pm.listRunningModelsOllamaHandler)
 	pm.ginEngine.GET("/api/tags", pm.listModelsOllamaHandler)
+
+	pm.ginEngine.HEAD("/", func(c *gin.Context) {
+		c.String(http.StatusOK, "")
+	})
 
 	// in proxymanager_loghandlers.go
 	pm.ginEngine.GET("/logs", pm.sendLogsHandlers)
@@ -376,6 +384,44 @@ func (pm *ProxyManager) listModelsOllamaHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"models": models})
 }
 
+func (pm *ProxyManager) showModelOllamaHandler(c *gin.Context) {
+	var req struct {
+		Model string `json:"model"`
+	}
+	if err := c.BindJSON(&req); err != nil || strings.TrimSpace(req.Model) == "" {
+		pm.sendErrorResponse(c, http.StatusBadRequest, "missing or invalid 'model' key")
+		return
+	}
+
+	cfg, _, found := pm.config.FindConfig(req.Model)
+	if !found {
+		pm.sendErrorResponse(c, http.StatusNotFound, fmt.Sprintf("model %s not found", req.Model))
+		return
+	}
+
+	resp := gin.H{
+		"modelfile":  "",
+		"parameters": "",
+		"template":   "",
+		"details": gin.H{
+			"format":             "gguf",
+			"family":             "",
+			"families":           []string{},
+			"parameter_size":     "",
+			"quantization_level": "",
+		},
+	}
+
+	if cfg.Name != "" {
+		resp["name"] = cfg.Name
+	}
+	if cfg.Description != "" {
+		resp["description"] = cfg.Description
+	}
+
+	c.JSON(http.StatusOK, resp)
+}
+
 func (pm *ProxyManager) proxyToUpstream(c *gin.Context) {
 	requestedModel := c.Param("model_id")
 
@@ -563,6 +609,92 @@ func (pm *ProxyManager) proxyOllamaHandler(c *gin.Context) {
 	c.Data(recorder.Code, "application/json", out)
 }
 
+func (pm *ProxyManager) proxyOllamaEmbeddingsHandler(c *gin.Context) {
+	bodyBytes, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		pm.sendErrorResponse(c, http.StatusBadRequest, "could not ready request body")
+		return
+	}
+
+	requestedModel := gjson.GetBytes(bodyBytes, "model").String()
+	if requestedModel == "" {
+		pm.sendErrorResponse(c, http.StatusBadRequest, "missing or invalid 'model' key")
+		return
+	}
+
+	realModelName, found := pm.config.RealModelName(requestedModel)
+	if !found {
+		pm.sendErrorResponse(c, http.StatusBadRequest, fmt.Sprintf("could not find real modelID for %s", requestedModel))
+		return
+	}
+
+	processGroup, _, err := pm.swapProcessGroup(realModelName)
+	if err != nil {
+		pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("error swapping process group: %s", err.Error()))
+		return
+	}
+
+	useModelName := pm.config.Models[realModelName].UseModelName
+	if useModelName != "" {
+		bodyBytes, err = sjson.SetBytes(bodyBytes, "model", useModelName)
+		if err != nil {
+			pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("error rewriting model name in JSON: %s", err.Error()))
+			return
+		}
+	}
+
+	endpoint := c.Request.URL.Path
+	if endpoint == "/api/embeddings" {
+		prompt := gjson.GetBytes(bodyBytes, "prompt")
+		if prompt.Exists() {
+			bodyBytes, err = sjson.SetBytes(bodyBytes, "input", prompt.Value())
+			if err != nil {
+				pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("error setting input param: %s", err.Error()))
+				return
+			}
+			bodyBytes, err = sjson.DeleteBytes(bodyBytes, "prompt")
+			if err != nil {
+				pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("error deleting prompt param: %s", err.Error()))
+				return
+			}
+		}
+	}
+
+	c.Request.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+	c.Request.Header.Del("transfer-encoding")
+	c.Request.Header.Set("content-length", strconv.Itoa(len(bodyBytes)))
+	c.Request.ContentLength = int64(len(bodyBytes))
+
+	c.Request.URL.Path = "/v1/embeddings"
+
+	recorder := httptest.NewRecorder()
+	if err := processGroup.ProxyRequest(realModelName, recorder, c.Request); err != nil {
+		pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("error proxying request: %s", err.Error()))
+		pm.proxyLogger.Errorf("Error Proxying Request for processGroup %s and model %s", processGroup.id, realModelName)
+		return
+	}
+
+	respBody := recorder.Body.Bytes()
+	embedding := gjson.GetBytes(respBody, "data.0.embedding").Value()
+
+	var out []byte
+	if endpoint == "/api/embed" {
+		msg := gin.H{
+			"model":             requestedModel,
+			"embeddings":        []interface{}{embedding},
+			"total_duration":    0,
+			"load_duration":     0,
+			"prompt_eval_count": 0,
+		}
+		out, _ = json.Marshal(msg)
+	} else {
+		msg := gin.H{"embedding": embedding}
+		out, _ = json.Marshal(msg)
+	}
+
+	c.Data(recorder.Code, "application/json", out)
+}
+
 func (pm *ProxyManager) proxyOAIPostFormHandler(c *gin.Context) {
 	// Parse multipart form
 	if err := c.Request.ParseMultipartForm(32 << 20); err != nil { // 32MB max memory, larger files go to tmp disk
@@ -709,6 +841,21 @@ func (pm *ProxyManager) listRunningProcessesHandler(context *gin.Context) {
 	}
 
 	context.JSON(http.StatusOK, response) // Always return 200 OK
+}
+
+func (pm *ProxyManager) listRunningModelsOllamaHandler(c *gin.Context) {
+	models := make([]gin.H, 0)
+	for _, processGroup := range pm.processGroups {
+		for _, process := range processGroup.processes {
+			if process.CurrentState() == StateReady {
+				models = append(models, gin.H{
+					"name":  process.ID,
+					"model": process.ID,
+				})
+			}
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{"models": models})
 }
 
 func (pm *ProxyManager) findGroupByModelName(modelName string) *ProcessGroup {
